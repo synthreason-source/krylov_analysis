@@ -1,30 +1,10 @@
 from __future__ import annotations
 
-"""
-Krylov Complexity Detector based on n-gram language model kernel.
-
-What's new:
-  - Krylov subspace construction via Lanczos algorithm on token transition operators
-  - Lanczos coefficients {a_n, b_n} capture the "dynamics" of sequence evolution
-  - Krylov complexity K(t) = Σ n |φ_n(t)|² measures operator spreading
-  - Anomaly detection via deviation from expected Lanczos coefficient growth
-  - Krylov entropy as complementary disorder measure
-  - Change-point detection in sequences via sliding-window K-complexity
-
-The detector treats the trained n-gram model as defining a Liouvillian/operator
-that governs token transitions. By running Lanczos recursion on this operator
-starting from different seed tokens/contexts, we get:
-  1. Lanczos coefficients that characterize the "dynamical structure"
-  2. Krylov complexity growth curves that detect structural breaks
-  3. Anomaly scores based on coefficient pattern deviations
-
-Still pure Python + numpy. No torch. Gradio UI updated with detector controls.
-"""
-
 import argparse
 import json
 import math
 import random
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import gradio as gr
 
+
 MODEL_PATH = "model.json"
 DEFAULT_CORPUS_FILE = "corpus.txt"
 
@@ -40,7 +21,13 @@ MAX_NEW_TOKENS = 800
 TEMPERATURE = 0.8
 TOP_K = 20
 MIN_COUNT = 1
-INSTRUCTION_WEIGHT = 1.5
+
+# Contextual generation weights.
+CONTEXT_WEIGHT = 1.35
+PROMPT_CONTEXT_WEIGHT = 0.45
+KRYLOV_CONTEXT_WEIGHT = 0.35
+RECENCY_WEIGHT = 0.20
+NOVELTY_PENALTY = 0.12
 
 PARADIGM_STEPS = 10
 PARADIGM_WEIGHT = 1.2
@@ -50,34 +37,132 @@ VECTOR_WEIGHT = 0.15
 
 IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
 
-# Krylov detector parameters
 KRYLOV_MAX_ITER = 50
 KRYLOV_WINDOW_SIZE = 5
 KRYLOV_STRIDE = 1
-ANOMALY_THRESHOLD = 2.0  # standard deviations
+ANOMALY_THRESHOLD = 2.0
 
 SCORECARD_PATH = "anomaly_scorecard.png"
 
 
-# ------------------- Krylov complexity core ------------------
+def tokenize(text: str) -> List[str]:
+    return re.findall(r"\S+", text.lower())
+
+
+def split_sentences(text: str) -> List[str]:
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def safe_log(value: float, floor: float = 1e-12) -> float:
+    return math.log(max(float(value), floor))
+
+
+def bag_of_words(tokens: Iterable[str]) -> Counter:
+    return Counter(t for t in tokens if t not in IGNORED_TOKENS)
+
+
+def cosine_similarity(
+    a: Dict[str, float],
+    b: Dict[str, float],
+    eps: float = 1e-12,
+) -> float:
+    if not a or not b:
+        return 0.0
+
+    common = set(a) & set(b)
+    dot = sum(a[k] * b[k] for k in common)
+    norm_a = math.sqrt(sum(v * v for v in a.values()))
+    norm_b = math.sqrt(sum(v * v for v in b.values()))
+
+    if norm_a < eps or norm_b < eps:
+        return 0.0
+
+    return dot / (norm_a * norm_b)
+
+
+def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
+    set_a = set(a) - IGNORED_TOKENS
+    set_b = set(b) - IGNORED_TOKENS
+
+    if not set_a or not set_b:
+        return 0.0
+
+    union = len(set_a | set_b)
+    return len(set_a & set_b) / union if union else 0.0
+
+
+def strip_structural_tokens(tokens: List[str]) -> List[str]:
+    return [t for t in tokens if t not in IGNORED_TOKENS]
+
+
+def _dense_matrix_from_vectors(
+    vectors: List[Dict[str, float]],
+) -> Tuple[np.ndarray, List[str]]:
+    keys = sorted({k for v in vectors for k in v})
+    key_index = {k: i for i, k in enumerate(keys)}
+
+    matrix = np.zeros((len(vectors), len(keys)), dtype=np.float64)
+
+    for row, vector in enumerate(vectors):
+        for key, weight in vector.items():
+            matrix[row, key_index[key]] = weight
+
+    return matrix, keys
+
+
+def _dominant_eigenvector(
+    matrix: np.ndarray,
+    iterations: int = 100,
+) -> np.ndarray:
+    n = matrix.shape[0]
+
+    if n == 0:
+        return np.zeros(0)
+
+    vector = np.ones(n, dtype=np.float64) / math.sqrt(n)
+
+    for _ in range(iterations):
+        next_vector = matrix @ vector
+        norm = np.linalg.norm(next_vector)
+
+        if norm < 1e-12:
+            return vector
+
+        next_vector /= norm
+
+        if (
+            np.allclose(next_vector, vector, atol=1e-10)
+            or np.allclose(next_vector, -vector, atol=1e-10)
+        ):
+            return next_vector
+
+        vector = next_vector
+
+    return vector
+
+
+# ---------------------------------------------------------------------------
+# Krylov analysis
+# ---------------------------------------------------------------------------
 
 @dataclass
 class KrylovResult:
-    """Results from Krylov complexity analysis."""
-    lanczos_a: List[float]  # diagonal coefficients
-    lanczos_b: List[float]  # off-diagonal coefficients
-    complexity_curve: List[float]  # K(t) over "time" steps
-    krylov_entropy: float  # entropy of |φ_n|² distribution
-    anomaly_score: float  # deviation from expected b_n pattern
-    basis_size: int  # actual Krylov dimension reached
+    lanczos_a: List[float]
+    lanczos_b: List[float]
+    complexity_curve: List[float]
+    krylov_entropy: float
+    anomaly_score: float
+    basis_size: int
 
 
 def _shannon_entropy_bits(v: np.ndarray) -> float:
-    """Shannon entropy in bits for a probability distribution."""
     magnitudes = np.abs(v)
     total = magnitudes.sum()
+
     if total <= 0:
         return 0.0
+
     probabilities = magnitudes[magnitudes > 0] / total
     return float(-(probabilities * np.log2(probabilities)).sum())
 
@@ -86,27 +171,24 @@ def _lanczos_recursion(
     operator_matrix: np.ndarray,
     initial_vector: np.ndarray,
     max_iter: int = 50,
-    tolerance: float = 1e-10
+    tolerance: float = 1e-10,
 ) -> Tuple[List[float], List[float], int]:
-    """
-    Lanczos algorithm for tridiagonalization.
-
-    Given a symmetric operator L and starting vector v_0, produces:
-      - a_n = ⟨v_n | L | v_n⟩ (diagonal)
-      - b_n = ‖w_n‖ where w_n = L v_n - a_n v_n - b_{n-1} v_{n-1}
-
-    The b_n coefficients control spreading in Krylov space.
-    Returns (a_coeffs, b_coeffs, actual_iterations).
-    """
     n = operator_matrix.shape[0]
+
     if n == 0:
         return [], [], 0
 
-    v_prev = np.zeros(n, dtype=np.float64)
-    v_curr = initial_vector / (np.linalg.norm(initial_vector) + 1e-12)
+    norm = np.linalg.norm(initial_vector)
 
-    a_coeffs = []
-    b_coeffs = []
+    if norm < 1e-12:
+        return [0.0], [0.0], 1
+
+    v_prev = np.zeros(n, dtype=np.float64)
+    v_curr = initial_vector / norm
+
+    a_coeffs: List[float] = []
+    b_coeffs: List[float] = []
+
     b_prev = 0.0
 
     for iteration in range(max_iter):
@@ -116,147 +198,318 @@ def _lanczos_recursion(
         a_coeffs.append(a_n)
 
         w = w - a_n * v_curr
+
         if iteration > 0:
             w = w - b_prev * v_prev
 
-        b_n = np.linalg.norm(w)
+        b_n = float(np.linalg.norm(w))
+        b_coeffs.append(b_n)
 
-        if b_n < tolerance or iteration == max_iter - 1:
-            b_coeffs.append(0.0)
+        if b_n < tolerance:
             return a_coeffs, b_coeffs, iteration + 1
 
-        b_coeffs.append(b_n)
-        b_prev = b_n
+        if iteration == max_iter - 1:
+            return a_coeffs, b_coeffs, iteration + 1
 
         v_prev = v_curr.copy()
-        v_curr = w / (b_n + 1e-12)
+        v_curr = w / b_n
+        b_prev = b_n
 
     return a_coeffs, b_coeffs, max_iter
 
 
-def _build_transition_operator(model: "NGramModel", context_tokens: List[str]) -> Tuple[np.ndarray, List[str], Dict[str, int]]:
-    """
-    Build a finite-dimensional transition operator from n-gram statistics.
-    """
+def _build_transition_operator(
+    model: "NGramModel",
+    context_tokens: List[str],
+) -> Tuple[np.ndarray, List[str], Dict[str, int]]:
     if not model.finalized:
         model.finalize()
 
     if context_tokens:
-        ctx = context_tokens[-2:] if len(context_tokens) >= 2 else context_tokens
-        base_dist = model.backoff_distribution(ctx[-1], ctx[-2] if len(ctx) > 1 else None)
+        previous = context_tokens[-1]
+        previous_previous = (
+            context_tokens[-2]
+            if len(context_tokens) > 1
+            else None
+        )
+        base_dist = model.backoff_distribution(
+            previous,
+            previous_previous,
+        )
     else:
         base_dist = model.normalize(model.unigram)
 
-    sorted_tokens = sorted(base_dist.items(), key=lambda x: x[1], reverse=True)
-    max_dim = min(64, len(sorted_tokens))
-    active_tokens = [t for t, _ in sorted_tokens[:max_dim]]
+    if not base_dist:
+        return (
+            np.zeros((1, 1), dtype=np.float64),
+            ["<unk>"],
+            {"<unk>": 0},
+        )
+
+    sorted_tokens = sorted(
+        base_dist.items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    active_tokens = [
+        t
+        for t, _ in sorted_tokens[:64]
+    ]
 
     if len(active_tokens) < 2:
-        return np.zeros((1, 1)), active_tokens or ["<unk>"], {t: i for i, t in enumerate(active_tokens or ["<unk>"])}
+        token = active_tokens[0] if active_tokens else "<unk>"
+        return (
+            np.zeros((1, 1), dtype=np.float64),
+            [token],
+            {token: 0},
+        )
 
-    token_to_idx = {t: i for i, t in enumerate(active_tokens)}
+    token_to_idx = {
+        token: i
+        for i, token in enumerate(active_tokens)
+    }
+
     n = len(active_tokens)
-
-    L = np.zeros((n, n), dtype=np.float64)
+    matrix = np.zeros(
+        (n, n),
+        dtype=np.float64,
+    )
 
     for i, token_i in enumerate(active_tokens):
-        next_dist = model.backoff_distribution(token_i, context_tokens[-1] if context_tokens else None)
+        next_dist = model.backoff_distribution(
+            token_i,
+            context_tokens[-1]
+            if context_tokens
+            else None,
+        )
 
         for j, token_j in enumerate(active_tokens):
-            p_ij = next_dist.get(token_j, 1e-12)
-            p_baseline = base_dist.get(token_j, 1e-12)
+            p_ij = max(
+                next_dist.get(token_j, 1e-12),
+                1e-12,
+            )
 
-            if p_ij > 1e-12 and p_baseline > 1e-12:
-                L[i, j] = math.log(p_ij / p_baseline)
-            else:
-                L[i, j] = 0.0
+            p_base = max(
+                base_dist.get(token_j, 1e-12),
+                1e-12,
+            )
 
-    L = (L + L.T) / 2.0
+            matrix[i, j] = math.log(
+                p_ij / p_base
+            )
 
-    return L, active_tokens, token_to_idx
+    matrix = (matrix + matrix.T) / 2.0
+
+    return matrix, active_tokens, token_to_idx
+
+
+def _krylov_dynamic_signal(
+    result: KrylovResult,
+    candidate_index: int,
+) -> float:
+    if not result.lanczos_b:
+        return 0.0
+
+    usable = [
+        abs(x)
+        for x in result.lanczos_b
+        if math.isfinite(x) and x > 1e-12
+    ]
+
+    if not usable:
+        return 0.0
+
+    idx = candidate_index % len(usable)
+    mean_b = float(np.mean(usable))
+
+    if mean_b < 1e-12:
+        return 0.0
+
+    return math.tanh(
+        (usable[idx] - mean_b) / mean_b
+    )
 
 
 def _compute_krylov_complexity(
     model: "NGramModel",
     seed_context: List[str],
     max_iter: int = KRYLOV_MAX_ITER,
-    time_steps: int = 20
+    time_steps: int = 20,
 ) -> KrylovResult:
-    """
-    Compute Krylov complexity for sequence evolution from a seed context.
-    """
     if not model.finalized:
         model.finalize()
 
-    L, tokens, token_to_idx = _build_transition_operator(model, seed_context)
-    n_dim = L.shape[0]
+    matrix, tokens, token_to_idx = (
+        _build_transition_operator(
+            model,
+            seed_context,
+        )
+    )
 
-    if n_dim < 2:
+    dimension = matrix.shape[0]
+
+    if dimension < 2:
         return KrylovResult(
             lanczos_a=[0.0],
             lanczos_b=[0.0],
             complexity_curve=[0.0],
             krylov_entropy=0.0,
             anomaly_score=0.0,
-            basis_size=1
+            basis_size=1,
         )
 
-    if seed_context and seed_context[-1] in token_to_idx:
-        v0 = np.zeros(n_dim, dtype=np.float64)
-        v0[token_to_idx[seed_context[-1]]] = 1.0
+    if (
+        seed_context
+        and seed_context[-1] in token_to_idx
+    ):
+        initial = np.zeros(
+            dimension,
+            dtype=np.float64,
+        )
+        initial[
+            token_to_idx[seed_context[-1]]
+        ] = 1.0
     else:
-        v0 = np.ones(n_dim, dtype=np.float64) / math.sqrt(n_dim)
+        initial = (
+            np.ones(dimension)
+            / math.sqrt(dimension)
+        )
 
-    a_coeffs, b_coeffs, actual_iter = _lanczos_recursion(L, v0, max_iter=max_iter)
+    a_coeffs, b_coeffs, basis_size = (
+        _lanczos_recursion(
+            matrix,
+            initial,
+            max_iter=max_iter,
+        )
+    )
 
-    complexity_curve = []
-    for t_step in range(time_steps):
-        t = t_step * 0.5
+    basis_dimension = len(a_coeffs)
 
-        phi_sq = []
-        for n_idx in range(len(b_coeffs) - 1):
-            b_effective = np.mean(b_coeffs[:min(n_idx+1, len(b_coeffs)-1)]) if b_coeffs else 1.0
-            if n_idx == 0:
-                prob = max(0.0, 1.0 - b_effective * t)
-            else:
-                prob = (b_effective * t) ** (2 * n_idx) / math.factorial(n_idx + 1) ** 2
-                prob = min(prob, 1.0)
-            phi_sq.append(prob)
+    if basis_dimension == 0:
+        return KrylovResult(
+            lanczos_a=[],
+            lanczos_b=[],
+            complexity_curve=[0.0],
+            krylov_entropy=0.0,
+            anomaly_score=0.0,
+            basis_size=0,
+        )
 
-        total = sum(phi_sq) + 1e-12
-        phi_sq = [p / total for p in phi_sq]
+    tridiagonal = np.zeros(
+        (basis_dimension, basis_dimension),
+        dtype=np.float64,
+    )
 
-        K_t = sum(n * p for n, p in enumerate(phi_sq))
-        complexity_curve.append(K_t)
+    for i, value in enumerate(a_coeffs):
+        tridiagonal[i, i] = value
 
-    phi_final = []
-    for n_idx in range(len(b_coeffs) - 1):
-        b_effective = np.mean(b_coeffs[:min(n_idx+1, len(b_coeffs)-1)]) if b_coeffs else 1.0
-        t = (time_steps - 1) * 0.5
-        if n_idx == 0:
-            prob = max(0.0, 1.0 - b_effective * t)
-        else:
-            prob = (b_effective * t) ** (2 * n_idx) / math.factorial(n_idx + 1) ** 2
-            prob = min(prob, 1.0)
-        phi_final.append(prob)
+    for i in range(
+        min(
+            basis_dimension - 1,
+            len(b_coeffs),
+        )
+    ):
+        value = b_coeffs[i]
 
-    total = sum(phi_final) + 1e-12
-    phi_final = [p / total for p in phi_final]
-    krylov_entropy = _shannon_entropy_bits(np.array(phi_final))
+        if value > 0:
+            tridiagonal[i, i + 1] = value
+            tridiagonal[i + 1, i] = value
 
-    if len(b_coeffs) > 3:
-        b_nonzero = [b for b in b_coeffs[:-1] if b > 1e-6]
-        if len(b_nonzero) > 2:
-            x = np.arange(len(b_nonzero))
-            y = np.array(b_nonzero)
-            coeffs = np.polyfit(x, y, 1)
-            trend = coeffs[0] * x + coeffs[1]
-            residuals = y - trend
-            std_residual = np.std(residuals)
-            mean_b = np.mean(b_nonzero)
-            anomaly_score = std_residual / (mean_b + 1e-6)
-        else:
-            anomaly_score = 0.0
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(
+            tridiagonal
+        )
+    except np.linalg.LinAlgError:
+        eigenvalues = np.diag(
+            tridiagonal
+        ).copy()
+        eigenvectors = np.eye(
+            basis_dimension
+        )
+
+    initial_basis = np.zeros(
+        basis_dimension,
+        dtype=np.float64,
+    )
+    initial_basis[0] = 1.0
+
+    projected = (
+        eigenvectors.T @ initial_basis
+    )
+
+    complexity_curve: List[float] = []
+    final_probabilities = np.array([1.0])
+
+    for t_index in range(
+        max(1, int(time_steps))
+    ):
+        time = t_index * 0.5
+
+        phase = np.exp(
+            -1j * eigenvalues * time
+        )
+
+        phi = (
+            eigenvectors
+            @ (phase * projected)
+        )
+
+        probabilities = np.abs(phi) ** 2
+        total = float(probabilities.sum())
+
+        if total > 1e-12:
+            probabilities /= total
+
+        complexity = float(
+            sum(
+                index * float(probabilities[index])
+                for index in range(
+                    len(probabilities)
+                )
+            )
+        )
+
+        complexity_curve.append(
+            complexity
+        )
+
+        final_probabilities = probabilities
+
+    krylov_entropy = _shannon_entropy_bits(
+        final_probabilities
+    )
+
+    b_values = [
+        float(b)
+        for b in b_coeffs
+        if b > 1e-6 and math.isfinite(b)
+    ]
+
+    if len(b_values) > 2:
+        x = np.arange(
+            len(b_values),
+            dtype=np.float64,
+        )
+        y = np.asarray(
+            b_values,
+            dtype=np.float64,
+        )
+
+        slope, intercept = np.polyfit(
+            x,
+            y,
+            1,
+        )
+
+        residuals = y - (
+            slope * x + intercept
+        )
+
+        anomaly_score = float(
+            np.std(residuals)
+            / (np.mean(y) + 1e-6)
+        )
     else:
         anomaly_score = 0.0
 
@@ -266,7 +519,7 @@ def _compute_krylov_complexity(
         complexity_curve=complexity_curve,
         krylov_entropy=krylov_entropy,
         anomaly_score=anomaly_score,
-        basis_size=actual_iter
+        basis_size=basis_size,
     )
 
 
@@ -274,133 +527,137 @@ def _sliding_window_krylov(
     model: "NGramModel",
     token_sequence: List[str],
     window_size: int = KRYLOV_WINDOW_SIZE,
-    stride: int = KRYLOV_STRIDE
+    stride: int = KRYLOV_STRIDE,
 ) -> List[Tuple[int, KrylovResult]]:
-    """
-    Compute Krylov complexity in sliding windows across a sequence.
-    """
-    results = []
+    results: List[
+        Tuple[int, KrylovResult]
+    ] = []
 
-    for start in range(0, len(token_sequence) - window_size + 1, stride):
-        window = token_sequence[start:start + window_size]
-        krylov_result = _compute_krylov_complexity(model, window)
-        results.append((start, krylov_result))
+    window_size = max(
+        1,
+        int(window_size),
+    )
+    stride = max(
+        1,
+        int(stride),
+    )
+
+    for start in range(
+        0,
+        len(token_sequence) - window_size + 1,
+        stride,
+    ):
+        window = token_sequence[
+            start:start + window_size
+        ]
+
+        result = _compute_krylov_complexity(
+            model,
+            window,
+        )
+
+        results.append(
+            (start, result)
+        )
 
     return results
 
 
 def _detect_anomalies(
-    krylov_results: List[Tuple[int, KrylovResult]],
-    threshold: float = ANOMALY_THRESHOLD
+    krylov_results: List[
+        Tuple[int, KrylovResult]
+    ],
+    threshold: float = ANOMALY_THRESHOLD,
 ) -> List[Tuple[int, float]]:
-    """
-    Detect anomalous windows based on Krylov metrics.
-    """
     if not krylov_results:
         return []
 
-    anomaly_scores = [r[1].anomaly_score for r in krylov_results]
-    entropies = [r[1].krylov_entropy for r in krylov_results]
-    basis_sizes = [r[1].basis_size for r in krylov_results]
+    anomaly_values = np.asarray(
+        [
+            result.anomaly_score
+            for _, result in krylov_results
+        ],
+        dtype=np.float64,
+    )
 
-    if not anomaly_scores:
-        return []
+    entropy_values = np.asarray(
+        [
+            result.krylov_entropy
+            for _, result in krylov_results
+        ],
+        dtype=np.float64,
+    )
 
-    median_anomaly = np.median(anomaly_scores)
-    std_anomaly = np.std(anomaly_scores) + 1e-6
-    median_entropy = np.median(entropies)
-    std_entropy = np.std(entropies) + 1e-6
+    basis_values = np.asarray(
+        [
+            result.basis_size
+            for _, result in krylov_results
+        ],
+        dtype=np.float64,
+    )
 
-    anomalies = []
-    for idx, (start_pos, result) in enumerate(krylov_results):
-        z_anomaly = (result.anomaly_score - median_anomaly) / std_anomaly
-        z_entropy = abs(result.krylov_entropy - median_entropy) / std_entropy
+    anomaly_median = float(
+        np.median(anomaly_values)
+    )
+    anomaly_std = float(
+        np.std(anomaly_values)
+    ) + 1e-6
+
+    entropy_median = float(
+        np.median(entropy_values)
+    )
+    entropy_std = float(
+        np.std(entropy_values)
+    ) + 1e-6
+
+    basis_median = float(
+        np.median(basis_values)
+    )
+
+    anomalies: List[
+        Tuple[int, float]
+    ] = []
+
+    for position, result in krylov_results:
+        z_anomaly = (
+            result.anomaly_score
+            - anomaly_median
+        ) / anomaly_std
+
+        z_entropy = (
+            abs(
+                result.krylov_entropy
+                - entropy_median
+            )
+            / entropy_std
+        )
 
         z_basis = 0.0
-        if median_basis := np.median(basis_sizes):
-            if result.basis_size < 0.5 * median_basis:
-                z_basis = 2.0
 
-        combined_score = max(z_anomaly, z_entropy, z_basis)
+        if (
+            basis_median > 0
+            and result.basis_size
+            < 0.5 * basis_median
+        ):
+            z_basis = 2.0
 
-        if combined_score > threshold:
-            anomalies.append((start_pos, combined_score))
+        combined = max(
+            float(z_anomaly),
+            float(z_entropy),
+            float(z_basis),
+        )
+
+        if combined > float(threshold):
+            anomalies.append(
+                (position, combined)
+            )
 
     return anomalies
 
 
-# --------------------------- shared helpers --------------------------
-
-def tokenize(text: str) -> List[str]:
-    return text.lower().split()
-
-
-def split_sentences(text: str) -> List[str]:
-    return [p.strip() for p in text.split(".") if p.strip()]
-
-
-def safe_log(value: float, floor: float = 1e-12) -> float:
-    return math.log(max(value, floor))
-
-
-def bag_of_words(tokens: Iterable[str]) -> Counter:
-    return Counter(t for t in tokens if t not in IGNORED_TOKENS)
-
-
-def cosine_similarity(a: Dict[str, float], b: Dict[str, float], eps: float = 1e-12) -> float:
-    if not a or not b:
-        return 0.0
-    common = set(a) & set(b)
-    dot = sum(a[k] * b[k] for k in common)
-    norm_a = math.sqrt(sum(v * v for v in a.values()))
-    norm_b = math.sqrt(sum(v * v for v in b.values()))
-    if norm_a < eps or norm_b < eps:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
-    set_a, set_b = set(a) - IGNORED_TOKENS, set(b) - IGNORED_TOKENS
-    if not set_a or not set_b:
-        return 0.0
-    union = len(set_a | set_b)
-    return len(set_a & set_b) / union if union else 0.0
-
-
-def strip_structural_tokens(tokens: List[str]) -> List[str]:
-    return [t for t in tokens if t not in IGNORED_TOKENS]
-
-
-def _dense_matrix_from_vectors(vectors: List[Dict[str, float]]) -> Tuple[np.ndarray, List[str]]:
-    """Stack sparse dict-vectors into one dense matrix over their shared key space."""
-    keys = sorted({k for v in vectors for k in v})
-    key_index = {k: i for i, k in enumerate(keys)}
-    matrix = np.zeros((len(vectors), len(keys)), dtype=np.float64)
-    for row, vector in enumerate(vectors):
-        for key, weight in vector.items():
-            matrix[row, key_index[key]] = weight
-    return matrix, keys
-
-
-def _dominant_eigenvector(matrix: np.ndarray, iterations: int = 100) -> np.ndarray:
-    """Power iteration for the leading eigenvector of a symmetric matrix."""
-    n = matrix.shape[0]
-    if n == 0:
-        return np.zeros(0)
-    vector = np.ones(n, dtype=np.float64) / math.sqrt(n)
-    for _ in range(iterations):
-        next_vector = matrix @ vector
-        norm = np.linalg.norm(next_vector)
-        if norm < 1e-12:
-            return vector
-        next_vector = next_vector / norm
-        if np.allclose(next_vector, vector, atol=1e-10) or np.allclose(next_vector, -vector, atol=1e-10):
-            return next_vector
-        vector = next_vector
-    return vector
-
-
-# --------------------------- corpus search ----------------------------
+# ---------------------------------------------------------------------------
+# Corpus search
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CorpusReference:
@@ -421,182 +678,680 @@ class Candidate:
 
 
 class CorpusSearch:
-    def __init__(self, lexical_weight=LEXICAL_WEIGHT, vector_weight=VECTOR_WEIGHT):
+    def __init__(
+        self,
+        lexical_weight: float = LEXICAL_WEIGHT,
+        vector_weight: float = VECTOR_WEIGHT,
+    ):
         self.lexical_weight = lexical_weight
         self.vector_weight = vector_weight
-        self.references: List[CorpusReference] = []
+        self.references: List[
+            CorpusReference
+        ] = []
 
-    def build_index(self, corpus_text: str) -> None:
-        sentences = split_sentences(corpus_text)
-        counts = Counter(s.lower() for s in sentences)
+    def build_index(
+        self,
+        corpus_text: str,
+    ) -> None:
+        sentences = split_sentences(
+            corpus_text
+        )
+
+        counts = Counter(
+            sentence.lower()
+            for sentence in sentences
+        )
+
         self.references = []
+
         for sentence in sentences:
             tokens = tokenize(sentence)
+
             if not tokens:
                 continue
+
             bow = bag_of_words(tokens)
+
             self.references.append(
                 CorpusReference(
                     sentence=sentence,
                     tokens=tokens,
-                    vector={t: float(c) for t, c in bow.items()},
-                    frequency=counts[sentence.lower()],
+                    vector={
+                        token: float(count)
+                        for token, count
+                        in bow.items()
+                    },
+                    frequency=counts[
+                        sentence.lower()
+                    ],
                 )
             )
 
-    def analyze(self, prompt: str, limit: int = 5) -> List[Candidate]:
+    def analyze(
+        self,
+        prompt: str,
+        limit: int = 5,
+    ) -> List[Candidate]:
         prompt_tokens = tokenize(prompt)
-        prompt_vector = {t: float(c) for t, c in bag_of_words(prompt_tokens).items()}
 
-        candidates = []
-        for ref in self.references:
-            symbolic = lexical_overlap(prompt_tokens, ref.tokens)
-            vec_sim = cosine_similarity(prompt_vector, ref.vector)
-            score = self.lexical_weight * symbolic + self.vector_weight * vec_sim
-            candidates.append(
-                Candidate(ref.sentence, symbolic, vec_sim, ref.frequency, score)
+        prompt_vector = {
+            token: float(count)
+            for token, count in
+            bag_of_words(
+                prompt_tokens
+            ).items()
+        }
+
+        candidates: List[
+            Candidate
+        ] = []
+
+        for reference in self.references:
+            overlap = lexical_overlap(
+                prompt_tokens,
+                reference.tokens,
             )
 
-        candidates.sort(key=lambda c: c.score, reverse=True)
+            vector_similarity = (
+                cosine_similarity(
+                    prompt_vector,
+                    reference.vector,
+                )
+            )
+
+            score = (
+                self.lexical_weight * overlap
+                + self.vector_weight
+                * vector_similarity
+            )
+
+            candidates.append(
+                Candidate(
+                    sentence=reference.sentence,
+                    symbolic_overlap=overlap,
+                    vector_similarity=vector_similarity,
+                    frequency=reference.frequency,
+                    score=score,
+                )
+            )
+
+        candidates.sort(
+            key=lambda item: item.score,
+            reverse=True,
+        )
+
         candidates = candidates[:limit]
-        for i, c in enumerate(candidates, start=1):
-            c.rank = i
+
+        for rank, candidate in enumerate(
+            candidates,
+            start=1,
+        ):
+            candidate.rank = rank
+
         return candidates
 
 
-# --------------------------- the kernel --------------------------------
+# ---------------------------------------------------------------------------
+# Contextual N-gram model
+# ---------------------------------------------------------------------------
 
 @dataclass
 class NGramModel:
-    """Trigram-backoff language model with Krylov complexity detector."""
-
     eos_token: str = "<eos>"
     unk_token: str = "<unk>"
     min_count: int = MIN_COUNT
 
-    unigram: Counter = field(default_factory=Counter)
-    bigram: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
-    trigram: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    unigram: Counter = field(
+        default_factory=Counter
+    )
 
-    lexical_vectors: Dict[str, Dict[str, float]] = field(default_factory=dict)
-    vocabulary: List[str] = field(default_factory=list)
+    bigram: Dict[str, Counter] = field(
+        default_factory=lambda:
+        defaultdict(Counter)
+    )
+
+    trigram: Dict[str, Counter] = field(
+        default_factory=lambda:
+        defaultdict(Counter)
+    )
+
+    lexical_vectors: Dict[
+        str,
+        Dict[str, float],
+    ] = field(default_factory=dict)
+
+    vocabulary: List[str] = field(
+        default_factory=list
+    )
+
     finalized: bool = False
 
-    # ---- training ----
-
-    def ingest_text(self, text: str) -> None:
+    def ingest_text(
+        self,
+        text: str,
+    ) -> None:
         for sentence in split_sentences(text):
             words = tokenize(sentence)
+
             if not words:
                 continue
-            self._add_sequence(["<bos>", "<bos>", *words, self.eos_token])
 
-    def _add_sequence(self, sequence: List[str]) -> None:
+            self._add_sequence(
+                [
+                    "<bos>",
+                    "<bos>",
+                    *words,
+                    self.eos_token,
+                ]
+            )
+
+    def _add_sequence(
+        self,
+        sequence: List[str],
+    ) -> None:
         if len(sequence) < 3:
             return
+
         for token in sequence:
             self.unigram[token] += 1
-        for left, right in zip(sequence, sequence[1:]):
+
+        for left, right in zip(
+            sequence,
+            sequence[1:],
+        ):
             self.bigram[left][right] += 1
-        for a, b, c in zip(sequence, sequence[1:], sequence[2:]):
-            self.trigram[f"{a}\t{b}"][c] += 1
+
+        for a, b, c in zip(
+            sequence,
+            sequence[1:],
+            sequence[2:],
+        ):
+            self.trigram[
+                f"{a}\t{b}"
+            ][c] += 1
+
         self.finalized = False
 
     def finalize(self) -> None:
-        self.vocabulary = sorted(t for t, c in self.unigram.items() if c >= self.min_count)
-        if self.unk_token not in self.vocabulary:
-            self.vocabulary.append(self.unk_token)
+        self.vocabulary = sorted(
+            token
+            for token, count
+            in self.unigram.items()
+            if count >= self.min_count
+        )
 
-        token_contexts: Dict[str, Counter] = defaultdict(Counter)
-        for context, counts in self.bigram.items():
-            for token, count in counts.items():
-                token_contexts[token][context] += count
+        if (
+            self.unk_token
+            not in self.vocabulary
+        ):
+            self.vocabulary.append(
+                self.unk_token
+            )
+
+        token_contexts: Dict[
+            str,
+            Counter,
+        ] = defaultdict(Counter)
+
+        for context, counts in (
+            self.bigram.items()
+        ):
+            for token, count in (
+                counts.items()
+            ):
+                token_contexts[
+                    token
+                ][context] += count
 
         self.lexical_vectors = {}
+
         for token in self.vocabulary:
-            counts = token_contexts.get(token, Counter())
-            total = sum(counts.values()) or 1
-            self.lexical_vectors[token] = {c: n / total for c, n in counts.items()}
+            counts = token_contexts.get(
+                token,
+                Counter(),
+            )
+
+            total = sum(counts.values())
+
+            if total <= 0:
+                self.lexical_vectors[
+                    token
+                ] = {}
+            else:
+                self.lexical_vectors[
+                    token
+                ] = {
+                    context: count / total
+                    for context, count
+                    in counts.items()
+                }
 
         self.finalized = True
 
-    # ---- prompt kernel (paradigm for the conversation) ----
-
-    def prompt_kernel_vector(self, prompt: str) -> Dict[str, float]:
+    def prompt_kernel_vector(
+        self,
+        prompt: str,
+    ) -> Dict[str, float]:
         if not self.finalized:
             self.finalize()
 
-        tokens = [t for t in tokenize(prompt) if t not in IGNORED_TOKENS]
-        tokens = [t for t in tokens if self.lexical_vectors.get(t)]
+        tokens = [
+            token
+            for token in tokenize(prompt)
+            if token not in IGNORED_TOKENS
+            and self.lexical_vectors.get(token)
+        ]
+
         if not tokens:
             return {}
 
-        vectors = [self.lexical_vectors[t] for t in tokens]
-        matrix, keys = _dense_matrix_from_vectors(vectors)
+        vectors = [
+            self.lexical_vectors[token]
+            for token in tokens
+        ]
 
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        norms[norms < 1e-12] = 1.0
+        matrix, keys = (
+            _dense_matrix_from_vectors(
+                vectors
+            )
+        )
+
+        if matrix.size == 0:
+            return {}
+
+        norms = np.linalg.norm(
+            matrix,
+            axis=1,
+            keepdims=True,
+        )
+
+        norms[
+            norms < 1e-12
+        ] = 1.0
+
         normalized = matrix / norms
-
         kernel = normalized @ normalized.T
-        weights = np.abs(_dominant_eigenvector(kernel))
-        total = weights.sum()
+
+        weights = np.abs(
+            _dominant_eigenvector(
+                kernel
+            )
+        )
+
+        total = float(weights.sum())
+
         if total < 1e-12:
             return {}
-        weights = weights / total
+
+        weights /= total
 
         paradigm = weights @ matrix
-        return {key: float(w) for key, w in zip(keys, paradigm) if abs(w) > 1e-9}
 
-    # ---- scoring / sampling ----
+        return {
+            key: float(value)
+            for key, value in zip(
+                keys,
+                paradigm,
+            )
+            if abs(value) > 1e-9
+        }
 
-    def backoff_distribution(self, previous: str, previous_previous: Optional[str]) -> Dict[str, float]:
+    def context_vector(
+        self,
+        context_tokens: List[str],
+        max_tokens: int = 8,
+    ) -> Dict[str, float]:
+        """
+        Build a recency-weighted second-order context vector.
+
+        A candidate token has a learned lexical vector describing the contexts
+        in which it appears. The current sequence is transformed into a
+        comparable vector, so generation can favor conceptual continuity
+        rather than simply the most grammatical continuation.
+        """
+        tokens = [
+            token
+            for token in context_tokens[
+                -max_tokens:
+            ]
+            if token not in IGNORED_TOKENS
+        ]
+
+        if not tokens:
+            return {}
+
+        accumulated: Dict[
+            str,
+            float,
+        ] = defaultdict(float)
+
+        count = len(tokens)
+
+        for position, token in enumerate(tokens):
+            vector = self.lexical_vectors.get(
+                token,
+                {},
+            )
+
+            if not vector:
+                continue
+
+            age = count - position
+
+            weight = 1.0 / (
+                0.75 + 0.35 * age
+            )
+
+            for key, value in vector.items():
+                accumulated[key] += (
+                    weight * value
+                )
+
+        norm = math.sqrt(
+            sum(
+                value * value
+                for value
+                in accumulated.values()
+            )
+        )
+
+        if norm < 1e-12:
+            return {}
+
+        return {
+            key: value / norm
+            for key, value
+            in accumulated.items()
+        }
+
+    def token_context_vector(
+        self,
+        token: str,
+    ) -> Dict[str, float]:
+        vector = self.lexical_vectors.get(
+            token,
+            {},
+        )
+
+        if not vector:
+            return {}
+
+        norm = math.sqrt(
+            sum(
+                value * value
+                for value
+                in vector.values()
+            )
+        )
+
+        if norm < 1e-12:
+            return {}
+
+        return {
+            key: value / norm
+            for key, value
+            in vector.items()
+        }
+
+    def backoff_distribution(
+        self,
+        previous: str,
+        previous_previous: Optional[str],
+    ) -> Dict[str, float]:
         if previous_previous is not None:
-            counts = self.trigram.get(f"{previous_previous}\t{previous}")
+            counts = self.trigram.get(
+                f"{previous_previous}\t{previous}"
+            )
+
             if counts:
-                return self.normalize(counts)
-        counts = self.bigram.get(previous)
+                return self.normalize(
+                    counts
+                )
+
+        counts = self.bigram.get(
+            previous
+        )
+
         if counts:
-            return self.normalize(counts)
-        return self.normalize(self.unigram)
+            return self.normalize(
+                counts
+            )
+
+        return self.normalize(
+            self.unigram
+        )
 
     @staticmethod
-    def normalize(counts: Counter) -> Dict[str, float]:
+    def normalize(
+        counts: Counter,
+    ) -> Dict[str, float]:
         total = sum(counts.values())
-        return {t: c / total for t, c in counts.items()} if total else {}
 
-    def resolve_context(self, prompt: str) -> Tuple[str, Optional[str]]:
+        if total <= 0:
+            return {}
+
+        return {
+            token: count / total
+            for token, count
+            in counts.items()
+        }
+
+    def resolve_context(
+        self,
+        prompt: str,
+    ) -> Tuple[str, Optional[str]]:
         tokens = tokenize(prompt)
+
         if not tokens:
             return "<bos>", None
+
         previous = tokens[-1]
-        previous_previous = tokens[-2] if len(tokens) >= 2 else None
-        return previous, previous_previous
+
+        previous_previous = (
+            tokens[-2]
+            if len(tokens) >= 2
+            else None
+        )
+
+        return (
+            previous,
+            previous_previous,
+        )
+
+    def _contextual_candidate_score(
+        self,
+        candidate: str,
+        generated_tokens: List[str],
+        context_vector: Optional[
+            Dict[str, float]
+        ] = None,
+        prompt_vector: Optional[
+            Dict[str, float]
+        ] = None,
+        krylov_result: Optional[
+            KrylovResult
+        ] = None,
+        candidate_rank: int = 0,
+    ) -> float:
+        recent = [
+            token
+            for token in generated_tokens[-8:]
+            if token not in IGNORED_TOKENS
+        ]
+
+        if context_vector is None:
+            context_vector = self.context_vector(
+                recent
+            )
+
+        candidate_vector = (
+            self.token_context_vector(
+                candidate
+            )
+        )
+
+        local_similarity = cosine_similarity(
+            context_vector,
+            candidate_vector,
+        )
+
+        prompt_similarity = 0.0
+
+        if prompt_vector:
+            prompt_similarity = cosine_similarity(
+                prompt_vector,
+                candidate_vector,
+            )
+
+        krylov_signal = 0.0
+
+        if krylov_result is not None:
+            candidate_index = (
+                sum(
+                    ord(char)
+                    for char in candidate
+                )
+                + candidate_rank
+            )
+
+            krylov_signal = (
+                _krylov_dynamic_signal(
+                    krylov_result,
+                    candidate_index,
+                )
+            )
+
+        repetition_count = recent.count(
+            candidate
+        )
+
+        repetition_penalty = (
+            NOVELTY_PENALTY
+            * max(
+                0,
+                repetition_count - 1,
+            )
+        )
+
+        recency_signal = 0.0
+
+        if recent:
+            previous = recent[-1]
+
+            pair_distribution = (
+                self.backoff_distribution(
+                    previous,
+                    recent[-2]
+                    if len(recent) >= 2
+                    else None,
+                )
+            )
+
+            pair_probability = (
+                pair_distribution.get(
+                    candidate,
+                    0.0,
+                )
+            )
+
+            recency_signal = (
+                math.log1p(
+                    pair_probability * 100.0
+                )
+                / 5.0
+            )
+
+        return (
+            CONTEXT_WEIGHT
+            * local_similarity
+            + PROMPT_CONTEXT_WEIGHT
+            * prompt_similarity
+            + KRYLOV_CONTEXT_WEIGHT
+            * krylov_signal
+            + RECENCY_WEIGHT
+            * recency_signal
+            - repetition_penalty
+        )
 
     def score_next_token(
         self,
         prompt: str,
         candidate_limit: int = 64,
-        instruction_vector: Optional[Dict[str, float]] = None,
+        instruction_vector: Optional[
+            Dict[str, float]
+        ] = None,
         instruction_weight: float = 0.0,
+        krylov_result: Optional[
+            KrylovResult
+        ] = None,
     ) -> Dict[str, float]:
         if not self.finalized:
             self.finalize()
 
-        previous, previous_previous = self.resolve_context(prompt)
-        base = self.backoff_distribution(previous, previous_previous)
+        tokens = tokenize(prompt)
+
+        previous, previous_previous = (
+            self.resolve_context(prompt)
+        )
+
+        base = self.backoff_distribution(
+            previous,
+            previous_previous,
+        )
+
         if not base:
             return {}
 
-        candidates = sorted(base, key=base.get, reverse=True)[:candidate_limit]
+        candidates = sorted(
+            base,
+            key=base.get,
+            reverse=True,
+        )[:max(
+            1,
+            int(candidate_limit),
+        )]
+
+        # Dynamic context vector is calculated once for this generation step.
+        context_vector = self.context_vector(
+            tokens[-8:]
+        )
 
         scores: Dict[str, float] = {}
-        for token in candidates:
-            score = safe_log(base[token])
 
-            if instruction_vector and instruction_weight:
-                likeness = cosine_similarity(instruction_vector, self.lexical_vectors.get(token, {}))
-                score += instruction_weight * likeness
+        for rank, token in enumerate(
+            candidates
+        ):
+            score = safe_log(
+                base[token]
+            )
+
+            score += (
+                self._contextual_candidate_score(
+                    token,
+                    tokens,
+                    context_vector=context_vector,
+                    prompt_vector=instruction_vector,
+                    krylov_result=krylov_result,
+                    candidate_rank=rank,
+                )
+            )
+
+            if (
+                instruction_vector
+                and instruction_weight
+            ):
+                similarity = cosine_similarity(
+                    instruction_vector,
+                    self.lexical_vectors.get(
+                        token,
+                        {},
+                    ),
+                )
+
+                score += (
+                    instruction_weight
+                    * similarity
+                )
 
             scores[token] = score
 
@@ -607,38 +1362,107 @@ class NGramModel:
         prompt: str,
         temperature: float,
         candidate_limit: int,
-        instruction_vector: Optional[Dict[str, float]] = None,
+        instruction_vector: Optional[
+            Dict[str, float]
+        ] = None,
         instruction_weight: float = 0.0,
+        krylov_result: Optional[
+            KrylovResult
+        ] = None,
     ) -> Dict[str, float]:
         scores = self.score_next_token(
-            prompt, candidate_limit, instruction_vector, instruction_weight
+            prompt,
+            candidate_limit,
+            instruction_vector,
+            instruction_weight,
+            krylov_result,
         )
+
         if not scores:
             return {}
 
-        temperature = max(temperature, 1e-5)
-        scaled = {t: s / temperature for t, s in scores.items()}
-        maximum = max(scaled.values())
-        exps = {t: math.exp(s - maximum) for t, s in scaled.items()}
-        total = sum(exps.values())
-        return {t: v / total for t, v in exps.items()} if total else {}
+        temperature = max(
+            float(temperature),
+            1e-5,
+        )
+
+        scaled = {
+            token: score / temperature
+            for token, score
+            in scores.items()
+        }
+
+        maximum = max(
+            scaled.values()
+        )
+
+        exponentials = {
+            token: math.exp(
+                score - maximum
+            )
+            for token, score
+            in scaled.items()
+        }
+
+        total = sum(
+            exponentials.values()
+        )
+
+        if total <= 0:
+            return {}
+
+        return {
+            token: value / total
+            for token, value
+            in exponentials.items()
+        }
 
     def sample_next(
         self,
         prompt: str,
         temperature: float = 0.8,
         top_k: int = 20,
-        instruction_vector: Optional[Dict[str, float]] = None,
+        instruction_vector: Optional[
+            Dict[str, float]
+        ] = None,
         instruction_weight: float = 0.0,
+        krylov_result: Optional[
+            KrylovResult
+        ] = None,
     ) -> str:
-        probs = self.probabilities(
-            prompt, temperature, max(top_k, 1), instruction_vector, instruction_weight
+        probabilities = self.probabilities(
+            prompt,
+            temperature,
+            max(
+                int(top_k),
+                1,
+            ),
+            instruction_vector,
+            instruction_weight,
+            krylov_result,
         )
-        if not probs:
+
+        if not probabilities:
             return self.eos_token
-        items = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
-        tokens, weights = zip(*items)
-        return random.choices(tokens, weights=weights, k=1)[0]
+
+        items = sorted(
+            probabilities.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:max(
+            1,
+            int(top_k),
+        )]
+
+        candidate_tokens, weights = zip(
+            *items
+        )
+
+        return random.choices(
+            candidate_tokens,
+            weights=weights,
+            k=1,
+        )[0]
 
     def generate(
         self,
@@ -646,374 +1470,918 @@ class NGramModel:
         max_new_tokens: int = 50,
         temperature: float = 0.8,
         top_k: int = 20,
-        instruction_vector: Optional[Dict[str, float]] = None,
+        instruction_vector: Optional[
+            Dict[str, float]
+        ] = None,
         instruction_weight: float = 0.0,
         paradigm_steps: int = 0,
         paradigm_weight: float = PARADIGM_WEIGHT,
     ) -> str:
+        """
+        Context-first generation.
+
+        The contextual state is refreshed throughout generation. The original
+        prompt is not treated as the only source of meaning: the sequence that
+        has actually emerged becomes the active context.
+        """
         generated = tokenize(prompt)
 
-        paradigm_vector = self.prompt_kernel_vector(prompt) if paradigm_steps > 0 else None
+        if not generated:
+            generated = ["<bos>"]
 
-        for step in range(max_new_tokens):
-            if paradigm_vector and step < paradigm_steps:
-                active_vector, active_weight = paradigm_vector, paradigm_weight
+        paradigm_vector = (
+            self.prompt_kernel_vector(prompt)
+            if int(paradigm_steps) > 0
+            else None
+        )
+
+        krylov_result: Optional[
+            KrylovResult
+        ] = None
+
+        refresh_every = 3
+
+        for step in range(
+            max(
+                0,
+                int(max_new_tokens),
+            )
+        ):
+            if (
+                step % refresh_every == 0
+            ):
+                recent_context = [
+                    token
+                    for token in generated[-8:]
+                    if token not in IGNORED_TOKENS
+                ]
+
+                if recent_context:
+                    krylov_result = (
+                        _compute_krylov_complexity(
+                            self,
+                            recent_context,
+                            max_iter=min(
+                                KRYLOV_MAX_ITER,
+                                24,
+                            ),
+                            time_steps=10,
+                        )
+                    )
+
+            if (
+                paradigm_vector
+                and step < int(paradigm_steps)
+            ):
+                active_vector = (
+                    paradigm_vector
+                )
+                active_weight = (
+                    paradigm_weight
+                )
             else:
-                active_vector, active_weight = instruction_vector, instruction_weight
+                active_vector = (
+                    instruction_vector
+                )
+                active_weight = (
+                    instruction_weight
+                )
 
             token = self.sample_next(
-                " ".join(generated), temperature, top_k, active_vector, active_weight
+                " ".join(generated),
+                temperature=temperature,
+                top_k=top_k,
+                instruction_vector=active_vector,
+                instruction_weight=active_weight,
+                krylov_result=krylov_result,
             )
+
+            if token == self.eos_token:
+                break
+
             generated.append(token)
 
-        return self.detokenize(strip_structural_tokens(generated))
+        return self.detokenize(
+            strip_structural_tokens(
+                generated
+            )
+        )
 
     @staticmethod
-    def detokenize(tokens: List[str]) -> str:
+    def detokenize(
+        tokens: List[str],
+    ) -> str:
         return " ".join(tokens)
-
-    # ---- persistence ----
 
     def to_dict(self) -> dict:
         return {
             "eos_token": self.eos_token,
             "unk_token": self.unk_token,
             "min_count": self.min_count,
-            "unigram": dict(self.unigram),
-            "bigram": {k: dict(v) for k, v in self.bigram.items()},
-            "trigram": {k: dict(v) for k, v in self.trigram.items()},
-            "lexical_vectors": self.lexical_vectors,
+            "unigram": dict(
+                self.unigram
+            ),
+            "bigram": {
+                key: dict(value)
+                for key, value
+                in self.bigram.items()
+            },
+            "trigram": {
+                key: dict(value)
+                for key, value
+                in self.trigram.items()
+            },
+            "lexical_vectors": (
+                self.lexical_vectors
+            ),
             "vocabulary": self.vocabulary,
             "finalized": self.finalized,
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "NGramModel":
+    def from_dict(
+        cls,
+        data: dict,
+    ) -> "NGramModel":
         model = cls(
-            eos_token=data.get("eos_token", "<eos>"),
-            unk_token=data.get("unk_token", "<unk>"),
-            min_count=data.get("min_count", MIN_COUNT),
+            eos_token=data.get(
+                "eos_token",
+                "<eos>",
+            ),
+            unk_token=data.get(
+                "unk_token",
+                "<unk>",
+            ),
+            min_count=data.get(
+                "min_count",
+                MIN_COUNT,
+            ),
         )
-        model.unigram = Counter(data.get("unigram", {}))
-        model.bigram = defaultdict(Counter, {k: Counter(v) for k, v in data.get("bigram", {}).items()})
-        model.trigram = defaultdict(Counter, {k: Counter(v) for k, v in data.get("trigram", {}).items()})
-        model.lexical_vectors = data.get("lexical_vectors", {})
-        model.vocabulary = data.get("vocabulary", [])
-        model.finalized = data.get("finalized", False)
+
+        model.unigram = Counter(
+            data.get(
+                "unigram",
+                {},
+            )
+        )
+
+        model.bigram = defaultdict(
+            Counter,
+            {
+                key: Counter(value)
+                for key, value
+                in data.get(
+                    "bigram",
+                    {},
+                ).items()
+            },
+        )
+
+        model.trigram = defaultdict(
+            Counter,
+            {
+                key: Counter(value)
+                for key, value
+                in data.get(
+                    "trigram",
+                    {},
+                ).items()
+            },
+        )
+
+        model.lexical_vectors = (
+            data.get(
+                "lexical_vectors",
+                {},
+            )
+        )
+
+        model.vocabulary = data.get(
+            "vocabulary",
+            [],
+        )
+
+        model.finalized = data.get(
+            "finalized",
+            False,
+        )
+
         return model
 
-    def save_json(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+    def save_json(
+        self,
+        path: str | Path,
+    ) -> None:
+        Path(path).write_text(
+            json.dumps(
+                self.to_dict(),
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
 
     @classmethod
-    def load_json(cls, path: str | Path) -> "NGramModel":
-        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+    def load_json(
+        cls,
+        path: str | Path,
+    ) -> "NGramModel":
+        return cls.from_dict(
+            json.loads(
+                Path(path).read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
 
 
-# ------------------------- globals & UI wiring ---------------------------
+# ---------------------------------------------------------------------------
+# Global application state
+# ---------------------------------------------------------------------------
 
-TEXT_MODEL: NGramModel | None = None
-CORPUS_SEARCH: CorpusSearch | None = None
-CORPUS_TEXT_CACHE: str | None = None
+TEXT_MODEL: Optional[NGramModel] = None
+CORPUS_SEARCH: Optional[CorpusSearch] = None
+CORPUS_TEXT_CACHE: Optional[str] = None
 
 
 def load_text_model() -> NGramModel:
     model_path = Path(MODEL_PATH)
+
     if not model_path.exists():
-        raise FileNotFoundError(f"{MODEL_PATH} not found. Upload a corpus and click 'Train model' first.")
-    model = NGramModel.load_json(model_path)
+        raise FileNotFoundError(
+            f"{MODEL_PATH} not found. "
+            "Upload a corpus and click 'Train model' first."
+        )
+
+    model = NGramModel.load_json(
+        model_path
+    )
+
     if not model.finalized:
         model.finalize()
+
     return model
 
 
-def load_corpus_search(corpus_text: str) -> CorpusSearch:
+def load_corpus_search(
+    corpus_text: str,
+) -> CorpusSearch:
     search = CorpusSearch()
     search.build_index(corpus_text)
     return search
 
 
-def reload_globals():
-    global TEXT_MODEL, CORPUS_SEARCH, CORPUS_TEXT_CACHE
+def reload_globals() -> None:
+    global TEXT_MODEL
+    global CORPUS_SEARCH
+    global CORPUS_TEXT_CACHE
+
     TEXT_MODEL = load_text_model()
 
     if CORPUS_TEXT_CACHE:
         corpus_text = CORPUS_TEXT_CACHE
     else:
-        default_path = Path(DEFAULT_CORPUS_FILE)
-        corpus_text = default_path.read_text(encoding="utf-8", errors="replace") if default_path.exists() else ""
+        default_path = Path(
+            DEFAULT_CORPUS_FILE
+        )
+
+        if default_path.exists():
+            corpus_text = (
+                default_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            )
+        else:
+            corpus_text = ""
+
         CORPUS_TEXT_CACHE = corpus_text
 
-    CORPUS_SEARCH = load_corpus_search(corpus_text)
-
-
-def format_matches(prompt: str, limit: int = 5) -> str:
-    if CORPUS_SEARCH is None or not CORPUS_SEARCH.references:
-        return "No corpus file loaded."
-    candidates = CORPUS_SEARCH.analyze(prompt, limit=limit)
-    if not candidates:
-        return "No corpus matches found."
-    return "\n".join(
-        f"{c.rank}. {c.sentence} (score={c.score:.3f}, overlap={c.symbolic_overlap:.3f}, vector={c.vector_similarity:.3f})"
-        for c in candidates
+    CORPUS_SEARCH = load_corpus_search(
+        corpus_text
     )
 
 
-def train_model_from_file(corpus_file):
+def format_matches(
+    prompt: str,
+    limit: int = 5,
+) -> str:
+    if (
+        CORPUS_SEARCH is None
+        or not CORPUS_SEARCH.references
+    ):
+        return "No corpus file loaded."
+
+    candidates = CORPUS_SEARCH.analyze(
+        prompt,
+        limit=limit,
+    )
+
+    if not candidates:
+        return "No corpus matches found."
+
+    return "\n".join(
+        (
+            f"{candidate.rank}. "
+            f"{candidate.sentence} "
+            f"(score={candidate.score:.3f}, "
+            f"overlap="
+            f"{candidate.symbolic_overlap:.3f}, "
+            f"vector="
+            f"{candidate.vector_similarity:.3f})"
+        )
+        for candidate in candidates
+    )
+
+
+def train_model_from_file(
+    corpus_file,
+):
     global CORPUS_TEXT_CACHE
+
     if corpus_file is None:
-        return "No corpus file uploaded.", "", ""
+        return (
+            "No corpus file uploaded.",
+            "",
+            "",
+        )
 
-    path = Path(corpus_file.name) if hasattr(corpus_file, "name") else Path(corpus_file)
+    path = (
+        Path(corpus_file.name)
+        if hasattr(
+            corpus_file,
+            "name",
+        )
+        else Path(corpus_file)
+    )
+
     if not path.exists():
-        return f"Corpus file not found: {path}", "", ""
+        return (
+            f"Corpus file not found: {path}",
+            "",
+            "",
+        )
 
-    corpus_text = path.read_text(encoding="utf-8", errors="replace")
+    corpus_text = path.read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
+
     CORPUS_TEXT_CACHE = corpus_text
 
     model = NGramModel()
     model.ingest_text(corpus_text)
     model.finalize()
-    model.save_json(Path(MODEL_PATH))
+    model.save_json(
+        Path(MODEL_PATH)
+    )
 
     reload_globals()
 
-    sample_lines = "\n".join(corpus_text.splitlines()[:5])
-    summary = (
-        f"Vocabulary: {len(model.vocabulary)}\n"
-        f"Unigrams: {len(model.unigram)}\n"
-        f"Bigram contexts: {len(model.bigram)}\n"
-        f"Trigram contexts: {len(model.trigram)}"
+    sample = "\n".join(
+        corpus_text.splitlines()[:5]
     )
-    return f"Model trained and saved to {MODEL_PATH}.", sample_lines, summary
+
+    summary = (
+        f"Vocabulary: "
+        f"{len(model.vocabulary)}\n"
+        f"Unigrams: "
+        f"{len(model.unigram)}\n"
+        f"Bigram contexts: "
+        f"{len(model.bigram)}\n"
+        f"Trigram contexts: "
+        f"{len(model.trigram)}\n"
+        f"Contextual generation: enabled\n"
+        f"Krylov contextual signal: enabled"
+    )
+
+    return (
+        f"Model trained and saved to "
+        f"{MODEL_PATH}.",
+        sample,
+        summary,
+    )
 
 
-def generate_from_prompt(user_prompt: str, paradigm_steps: int):
-    if TEXT_MODEL is None or CORPUS_SEARCH is None:
-        return "Model not loaded. Upload a corpus and click 'Train model' first.", ""
+def generate_from_prompt(
+    user_prompt: str,
+    paradigm_steps: int,
+):
+    if (
+        TEXT_MODEL is None
+        or CORPUS_SEARCH is None
+    ):
+        return (
+            "Model not loaded. Upload a corpus "
+            "and click 'Train model' first.",
+            "",
+        )
 
-    prompt = user_prompt.strip() if user_prompt and user_prompt.strip() else "<bos>"
+    prompt = (
+        user_prompt.strip()
+        if user_prompt
+        and user_prompt.strip()
+        else "<bos>"
+    )
 
     generated = TEXT_MODEL.generate(
         prompt=prompt,
         max_new_tokens=MAX_NEW_TOKENS,
         temperature=TEMPERATURE,
         top_k=TOP_K,
-        paradigm_steps=int(paradigm_steps),
+        paradigm_steps=int(
+            paradigm_steps
+        ),
         paradigm_weight=PARADIGM_WEIGHT,
     )
-    corpus_matches = format_matches(prompt, limit=5) if prompt != "<bos>" else "No prompt provided for corpus search."
 
-    return corpus_matches, generated
+    matches = (
+        format_matches(
+            prompt,
+            limit=5,
+        )
+        if prompt != "<bos>"
+        else "No prompt provided for corpus search."
+    )
+
+    return matches, generated
 
 
-# ------------------------- Krylov detector UI functions -------------------------
+# ---------------------------------------------------------------------------
+# Krylov UI functions
+# ---------------------------------------------------------------------------
 
-def analyze_krylov_single(prompt: str, max_iter: int) -> str:
-    """Analyze Krylov complexity for a single prompt."""
+def analyze_krylov_single(
+    prompt: str,
+    max_iter: int,
+) -> str:
     if TEXT_MODEL is None:
         return "Model not loaded."
 
     tokens = tokenize(prompt)
+
     if not tokens:
         return "Empty prompt."
 
-    result = _compute_krylov_complexity(TEXT_MODEL, tokens, max_iter=max_iter)
+    result = _compute_krylov_complexity(
+        TEXT_MODEL,
+        tokens,
+        max_iter=int(max_iter),
+    )
 
-    output_lines = [
-        f"Krylov Analysis for: '{prompt[:50]}...' ",
+    lines = [
+        f"Krylov Analysis for: "
+        f"'{prompt[:80]}'",
         "",
-        f"Basis size: {result.basis_size}",
-        f"Lanczos a (diagonal): {[round(a, 4) for a in result.lanczos_a[:10]]}{'...' if len(result.lanczos_a) > 10 else ''}",
-        f"Lanczos b (off-diagonal): {[round(b, 4) for b in result.lanczos_b[:10]]}{'...' if len(result.lanczos_b) > 10 else ''}",
+        f"Basis size: "
+        f"{result.basis_size}",
+        (
+            "Lanczos a: "
+            f"{[round(x, 4) for x in result.lanczos_a[:10]]}"
+            f"{'...' if len(result.lanczos_a) > 10 else ''}"
+        ),
+        (
+            "Lanczos b: "
+            f"{[round(x, 4) for x in result.lanczos_b[:10]]}"
+            f"{'...' if len(result.lanczos_b) > 10 else ''}"
+        ),
         "",
-        f"Krylov entropy: {result.krylov_entropy:.4f} bits",
-        f"Anomaly score: {result.anomaly_score:.4f}",
+        f"Krylov entropy: "
+        f"{result.krylov_entropy:.4f} bits",
+        f"Anomaly score: "
+        f"{result.anomaly_score:.4f}",
         "",
         "Complexity curve K(t):",
     ]
 
-    for t, k_val in enumerate(result.complexity_curve):
-        output_lines.append(f"  t={t}: K = {k_val:.4f}")
+    for index, value in enumerate(
+        result.complexity_curve
+    ):
+        lines.append(
+            f"  t={index}: K={value:.4f}"
+        )
 
-    return "\n".join(output_lines)
+    lines.extend(
+        [
+            "",
+            "The anomaly signal uses learned "
+            "transition dynamics and Krylov "
+            "spreading rather than grammatical "
+            "correctness alone.",
+        ]
+    )
+
+    return "\n".join(lines)
 
 
-def analyze_krylov_sequence(sequence_text: str, window_size: int, stride: int, threshold: float) -> str:
-    """Analyze Krylov complexity across a token sequence with sliding windows."""
+def analyze_krylov_sequence(
+    sequence_text: str,
+    window_size: int,
+    stride: int,
+    threshold: float,
+) -> str:
     if TEXT_MODEL is None:
         return "Model not loaded."
 
     tokens = tokenize(sequence_text)
+
+    window_size = int(window_size)
+    stride = int(stride)
+
     if len(tokens) < window_size:
-        return f"Sequence too short ({len(tokens)} tokens). Need at least {window_size}."
+        return (
+            f"Sequence too short "
+            f"({len(tokens)} tokens). "
+            f"Need at least {window_size}."
+        )
 
-    window_results = _sliding_window_krylov(TEXT_MODEL, tokens, window_size=window_size, stride=stride)
+    results = _sliding_window_krylov(
+        TEXT_MODEL,
+        tokens,
+        window_size=window_size,
+        stride=stride,
+    )
 
-    if not window_results:
+    if not results:
         return "No windows analyzed."
 
-    anomalies = _detect_anomalies(window_results, threshold=threshold)
+    anomalies = _detect_anomalies(
+        results,
+        threshold=float(threshold),
+    )
 
-    output_lines = [
-        f"Krylov Sequence Analysis",
-        f"Sequence length: {len(tokens)} tokens",
-        f"Window size: {window_size}, stride: {stride}",
+    anomaly_positions = {
+        position
+        for position, _ in anomalies
+    }
+
+    lines = [
+        "Krylov Sequence Analysis",
+        f"Sequence length: "
+        f"{len(tokens)} tokens",
+        f"Window size: "
+        f"{window_size}, stride: {stride}",
         "",
         "Window-by-window results:",
     ]
 
-    for start_pos, result in window_results:
-        window_tokens = tokens[start_pos:start_pos + window_size]
-        window_text = " ".join(window_tokens[:10]) + ("..." if len(window_tokens) > 10 else "")
+    for start, result in results:
+        window_tokens = tokens[
+            start:start + window_size
+        ]
 
-        anomaly_flag = " [ANOMALY]" if any(abs(start_pos - a[0]) < stride for a in anomalies) else ""
-        output_lines.append(
-            f"\n  Window {start_pos}-{start_pos + window_size}: {window_text}"
-            f"\n    K={result.complexity_curve[-1]:.3f}, "
+        preview = " ".join(
+            window_tokens[:10]
+        )
+
+        if len(window_tokens) > 10:
+            preview += "..."
+
+        flag = (
+            " [CONTEXTUAL ANOMALY]"
+            if start in anomaly_positions
+            else ""
+        )
+
+        final_k = (
+            result.complexity_curve[-1]
+            if result.complexity_curve
+            else 0.0
+        )
+
+        lines.append(
+            f"\n  Window {start}-"
+            f"{start + window_size}: "
+            f"{preview}"
+            f"\n    K={final_k:.3f}, "
             f"S={result.krylov_entropy:.3f}, "
-            f"anomaly={result.anomaly_score:.3f}{anomaly_flag}"
+            f"anomaly="
+            f"{result.anomaly_score:.3f}"
+            f"{flag}"
         )
 
     if anomalies:
-        output_lines.append("")
-        output_lines.append(f"Detected {len(anomalies)} anomalies at positions:")
-        for pos, score in anomalies:
-            anomaly_tokens = tokens[pos:pos + min(10, len(tokens) - pos)]
-            anomaly_text = " ".join(anomaly_tokens)
-            output_lines.append(f"  Position {pos}: {anomaly_text} (score = {score:.3f})")
+        lines.append("")
+        lines.append(
+            f"Detected {len(anomalies)} "
+            "contextual anomalies:"
+        )
+
+        for position, score in anomalies:
+            preview = tokens[
+                position:
+                position + min(
+                    10,
+                    len(tokens) - position,
+                )
+            ]
+
+            lines.append(
+                f"  Position {position}: "
+                f"{' '.join(preview)} "
+                f"(context score={score:.3f})"
+            )
     else:
-        output_lines.append("")
-        output_lines.append("No anomalies detected.")
+        lines.extend(
+            [
+                "",
+                "No contextual anomalies detected.",
+            ]
+        )
 
-    return "\n".join(output_lines)
+    return "\n".join(lines)
 
 
-def detect_change_points(sequence_text: str, window_size: int) -> str:
-    """Detect structural change points in sequence via Krylov complexity."""
+def detect_change_points(
+    sequence_text: str,
+    window_size: int,
+) -> str:
     if TEXT_MODEL is None:
         return "Model not loaded."
 
     tokens = tokenize(sequence_text)
+    window_size = int(window_size)
+
     if len(tokens) < 2 * window_size:
-        return f"Sequence too short for change-point detection."
+        return (
+            "Sequence too short for "
+            "change-point detection."
+        )
 
-    stride = max(1, window_size // 4)
-    window_results = _sliding_window_krylov(TEXT_MODEL, tokens, window_size=window_size, stride=stride)
+    stride = max(
+        1,
+        window_size // 4,
+    )
 
-    if len(window_results) < 3:
-        return "Not enough windows for change-point detection."
+    results = _sliding_window_krylov(
+        TEXT_MODEL,
+        tokens,
+        window_size=window_size,
+        stride=stride,
+    )
+
+    if len(results) < 3:
+        return (
+            "Not enough windows for "
+            "change-point detection."
+        )
 
     change_points = []
-    prev_result = None
+    previous = None
 
-    for start_pos, result in window_results:
-        if prev_result is not None:
-            delta_k = abs(result.complexity_curve[-1] - prev_result.complexity_curve[-1])
-            delta_s = abs(result.krylov_entropy - prev_result.krylov_entropy)
-            delta_anomaly = abs(result.anomaly_score - prev_result.anomaly_score)
+    for start, result in results:
+        if previous is not None:
+            delta_k = abs(
+                result.complexity_curve[-1]
+                - previous.complexity_curve[-1]
+            )
 
-            if delta_k > 0.5 or delta_s > 0.3 or delta_anomaly > 1.0:
-                change_points.append((start_pos, delta_k, delta_s, delta_anomaly))
+            delta_entropy = abs(
+                result.krylov_entropy
+                - previous.krylov_entropy
+            )
 
-        prev_result = result
+            delta_anomaly = abs(
+                result.anomaly_score
+                - previous.anomaly_score
+            )
 
-    output_lines = [
-        f"Change-Point Detection Results",
-        f"Sequence: {len(tokens)} tokens, window size: {window_size}",
+            if (
+                delta_k > 0.5
+                or delta_entropy > 0.3
+                or delta_anomaly > 1.0
+            ):
+                change_points.append(
+                    (
+                        start,
+                        delta_k,
+                        delta_entropy,
+                        delta_anomaly,
+                    )
+                )
+
+        previous = result
+
+    lines = [
+        "Change-Point Detection Results",
+        (
+            f"Sequence: {len(tokens)} tokens, "
+            f"window size: {window_size}"
+        ),
         "",
     ]
 
     if change_points:
-        output_lines.append(f"Found {len(change_points)} potential change points:")
-        for pos, dk, ds, da in change_points:
-            context_tokens = tokens[max(0, pos-2):pos + min(8, len(tokens) - pos)]
-            context_text = " ".join(context_tokens)
-            output_lines.append(
-                f"  Position {pos}: ...{context_text}..."
-                f"\n    ΔK={dk:.3f}, ΔS={ds:.3f}, Δanomaly={da:.3f}"
+        lines.append(
+            f"Found {len(change_points)} "
+            "potential contextual change points:"
+        )
+
+        for (
+            position,
+            delta_k,
+            delta_entropy,
+            delta_anomaly,
+        ) in change_points:
+            context = tokens[
+                max(0, position - 2):
+                position + min(
+                    8,
+                    len(tokens) - position,
+                )
+            ]
+
+            lines.append(
+                f"  Position {position}: "
+                f"...{' '.join(context)}..."
+                f"\n    ΔK={delta_k:.3f}, "
+                f"ΔS={delta_entropy:.3f}, "
+                f"Δanomaly={delta_anomaly:.3f}"
             )
     else:
-        output_lines.append("No significant change points detected.")
-        output_lines.append("")
-        output_lines.append("Sequence appears structurally homogeneous by Krylov metrics.")
+        lines.extend(
+            [
+                "No significant contextual "
+                "change points detected.",
+                "",
+                "The sequence appears structurally "
+                "homogeneous by Krylov metrics.",
+            ]
+        )
 
-    return "\n".join(output_lines)
+    return "\n".join(lines)
 
 
-# ------------------------- Anomaly scorecard PNG --------------------------
-#
-# Renders the *full* scanned text with every anomalous window's words
-# wrapped in [ ], plus a small per-window score table underneath, as one
-# PNG "scorecard" image the user can save or share.
+# ---------------------------------------------------------------------------
+# Scorecard
+# ---------------------------------------------------------------------------
 
 def _bracket_anomalous_windows(
     tokens: List[str],
     window_size: int,
     anomaly_positions: Iterable[int],
 ) -> str:
-    """Wrap every token covered by an anomalous window in [ ]. Adjacent or
-    overlapping anomalous windows are merged into a single bracket run so
-    the output doesn't read as "[word] [word] [word]".
-    """
-    covered = [False] * len(tokens)
-    for pos in anomaly_positions:
-        for i in range(pos, min(pos + window_size, len(tokens))):
-            covered[i] = True
+    covered = [
+        False
+        for _ in tokens
+    ]
+
+    for position in anomaly_positions:
+        for index in range(
+            position,
+            min(
+                position + window_size,
+                len(tokens),
+            ),
+        ):
+            covered[index] = True
 
     pieces: List[str] = []
-    i = 0
-    while i < len(tokens):
-        if covered[i]:
-            j = i
+    index = 0
+
+    while index < len(tokens):
+        if covered[index]:
+            end = index
             run: List[str] = []
-            while j < len(tokens) and covered[j]:
-                run.append(tokens[j])
-                j += 1
-            pieces.append("[" + " ".join(run) + "]")
-            i = j
+
+            while (
+                end < len(tokens)
+                and covered[end]
+            ):
+                run.append(tokens[end])
+                end += 1
+
+            pieces.append(
+                "[" + " ".join(run) + "]"
+            )
+            index = end
         else:
-            pieces.append(tokens[i])
-            i += 1
+            pieces.append(tokens[index])
+            index += 1
 
     return " ".join(pieces)
 
 
 def _draw_scorecard_png(
     annotated_text: str,
+    score_rows: List[Dict[str, Any]],
+    threshold: float,
     anomaly_count: int,
     window_count: int,
-    threshold: float,
     output_path: str,
 ) -> None:
     import textwrap
+
     import matplotlib
+
     matplotlib.use("Agg")
+
     import matplotlib.pyplot as plt
 
-    wrapped = textwrap.fill(annotated_text, width=78)
-    # Size the figure to the text itself so nothing gets cut off: estimate
-    # height from the number of wrapped lines instead of using a fixed
-    # canvas that a longer sequence could overflow.
-    line_count = max(wrapped.count("\n") + 1, 1)
-    fig_height = 1.3 + line_count * 0.28
-
-    fig, ax_text = plt.subplots(figsize=(11, fig_height))
-    fig.suptitle("Krylov Anomaly Scorecard", fontsize=17, fontweight="bold")
-
-    ax_text.axis("off")
-    ax_text.set_title(
-        f"Scanned text  —  {anomaly_count} of {window_count} windows flagged  "
-        f"(threshold={threshold})  —  [bracketed] = anomalous",
-        fontsize=11, loc="left", color="#333333",
-    )
-    ax_text.text(
-        0.0, 1.0, wrapped, va="top", ha="left",
-        fontsize=10.5, family="monospace", transform=ax_text.transAxes,
+    fig, (
+        text_axis,
+        table_axis,
+    ) = plt.subplots(
+        2,
+        1,
+        figsize=(11, 8.5),
+        gridspec_kw={
+            "height_ratios": [3, 2]
+        },
     )
 
-    plt.tight_layout(rect=[0, 0, 1, 0.92])
-    fig.savefig(output_path, dpi=150)
+    fig.suptitle(
+        "Krylov Contextual Anomaly Scorecard",
+        fontsize=17,
+        fontweight="bold",
+    )
+
+    text_axis.axis("off")
+
+    text_axis.set_title(
+        (
+            f"Scanned text — "
+            f"{anomaly_count} of "
+            f"{window_count} windows flagged "
+            "([bracketed] = contextual anomaly)"
+        ),
+        fontsize=11,
+        loc="left",
+    )
+
+    wrapped = textwrap.fill(
+        annotated_text,
+        width=78,
+    )
+
+    text_axis.text(
+        0.0,
+        1.0,
+        wrapped,
+        va="top",
+        ha="left",
+        fontsize=10.5,
+        family="monospace",
+        transform=text_axis.transAxes,
+    )
+
+    table_axis.axis("off")
+
+    table_axis.set_title(
+        (
+            f"Per-window scores "
+            f"(flag threshold = {threshold})"
+        ),
+        fontsize=11,
+        loc="left",
+    )
+
+    columns = [
+        "start",
+        "K(t)",
+        "entropy (bits)",
+        "anomaly score",
+        "flag",
+    ]
+
+    cells = []
+
+    for row in score_rows:
+        cells.append(
+            [
+                str(row["start"]),
+                f"{row['K']:.3f}",
+                f"{row['entropy']:.3f}",
+                f"{row['anomaly_score']:.3f}",
+                (
+                    "contextual anomaly"
+                    if row["flagged"]
+                    else ""
+                ),
+            ]
+        )
+
+    table = table_axis.table(
+        cellText=cells,
+        colLabels=columns,
+        loc="upper center",
+        cellLoc="center",
+    )
+
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.35)
+
+    plt.tight_layout(
+        rect=[0, 0, 1, 0.94]
+    )
+
+    fig.savefig(
+        output_path,
+        dpi=150,
+        bbox_inches="tight",
+    )
+
     plt.close(fig)
 
 
@@ -1023,202 +2391,428 @@ def generate_anomaly_scorecard(
     stride: int,
     threshold: float,
 ) -> Tuple[Optional[str], str]:
-    """Run the same sliding-window Krylov anomaly scan as the text tab, then
-    render it as one PNG: just the full text with anomalous windows
-    bracketed in [ ]. Returns (png_path_or_None, message).
-    """
     if TEXT_MODEL is None:
         return None, "Model not loaded."
 
     tokens = tokenize(sequence_text)
-    if len(tokens) < window_size:
-        return None, f"Sequence too short ({len(tokens)} tokens). Need at least {window_size}."
 
-    window_results = _sliding_window_krylov(TEXT_MODEL, tokens, window_size=window_size, stride=stride)
-    if not window_results:
+    window_size = int(window_size)
+    stride = int(stride)
+
+    if len(tokens) < window_size:
+        return (
+            None,
+            f"Sequence too short "
+            f"({len(tokens)} tokens). "
+            f"Need at least {window_size}.",
+        )
+
+    results = _sliding_window_krylov(
+        TEXT_MODEL,
+        tokens,
+        window_size=window_size,
+        stride=stride,
+    )
+
+    if not results:
         return None, "No windows analyzed."
 
-    anomalies = _detect_anomalies(window_results, threshold=threshold)
-    anomaly_lookup = dict(anomalies)  # start_pos -> combined score
+    anomalies = _detect_anomalies(
+        results,
+        threshold=float(threshold),
+    )
 
-    annotated_text = _bracket_anomalous_windows(tokens, window_size, anomaly_lookup.keys())
+    anomaly_lookup = dict(anomalies)
 
-    output_path = str(Path(SCORECARD_PATH).resolve())
+    annotated = _bracket_anomalous_windows(
+        tokens,
+        window_size,
+        anomaly_lookup.keys(),
+    )
+
+    rows = [
+        {
+            "start": start,
+            "K": (
+                result.complexity_curve[-1]
+                if result.complexity_curve
+                else 0.0
+            ),
+            "entropy": result.krylov_entropy,
+            "anomaly_score": result.anomaly_score,
+            "flagged": (
+                start in anomaly_lookup
+            ),
+        }
+        for start, result in results
+    ]
+
+    output_path = str(
+        Path(
+            SCORECARD_PATH
+        ).resolve()
+    )
+
     _draw_scorecard_png(
-        annotated_text,
-        anomaly_count=len(anomaly_lookup),
-        window_count=len(window_results),
-        threshold=threshold,
+        annotated,
+        rows,
+        float(threshold),
+        anomaly_count=len(
+            anomaly_lookup
+        ),
+        window_count=len(results),
         output_path=output_path,
     )
 
-    message = (
-        f"{len(anomaly_lookup)} of {len(window_results)} windows flagged as anomalous "
-        f"(threshold={threshold}). Scorecard saved."
+    return (
+        output_path,
+        (
+            f"{len(anomaly_lookup)} of "
+            f"{len(results)} windows flagged "
+            "as contextual anomalies. "
+            "Scorecard saved."
+        ),
     )
-    return output_path, message
 
 
-# ------------------------- Gradio UI ---------------------------
+# ---------------------------------------------------------------------------
+# Gradio application
+# ---------------------------------------------------------------------------
 
-with gr.Blocks(title="Krylov Detector") as demo:
+with gr.Blocks(
+    title="Krylov Contextual Detector"
+) as demo:
+
     gr.Markdown(
         """
 # Krylov Complexity Detector
 
-N-gram language model + Krylov subspace analysis for sequence anomaly detection.
+**Context-first n-gram generation + Krylov sequence analysis**
 
-**Workflow:**
-1. Upload corpus → Train model
-2. Use Krylov analysis tabs to detect anomalies, change-points, and structural breaks
-3. Lanczos coefficients {a_n, b_n} characterize the "dynamics" of token transitions
-4. Krylov complexity K(t) measures operator spreading - sudden changes indicate anomalies
+The generator follows the evolving contextual trajectory of the text rather
+than treating grammatical probability as the sole criterion.
 """
     )
 
-    gr.Markdown("## 1. Corpus & Training")
-    with gr.Row():
-        with gr.Column(scale=1):
-            corpus_file_input = gr.File(label="Corpus file (any type)", file_types=["file"])
-            train_button = gr.Button("Train model", variant="primary")
-        with gr.Column(scale=2):
-            train_status = gr.Textbox(label="Training status", lines=2)
-            corpus_sample = gr.Textbox(label="Corpus sample (first 5 lines)", lines=5)
-            model_summary = gr.Textbox(label="Model summary", lines=6)
-
-    train_button.click(
-        fn=train_model_from_file,
-        inputs=[corpus_file_input],
-        outputs=[train_status, corpus_sample, model_summary],
-    )
-
-    with gr.Tab("Single Prompt Analysis"):
-        gr.Markdown(
-            """
-### Krylov Analysis for Single Prompt
-
-Computes Lanczos coefficients and complexity curve for one prompt's token dynamics.
-"""
-        )
+    with gr.Tab(
+        "Corpus & Training"
+    ):
         with gr.Row():
             with gr.Column(scale=1):
-                krylov_prompt = gr.Textbox(label="Prompt to analyze", lines=3)
-                krylov_max_iter = gr.Slider(
-                    minimum=5, maximum=100, value=30, step=1,
-                    label="Max Lanczos iterations"
+                corpus_file_input = gr.File(
+                    label="Corpus file",
+                    file_types=["file"],
                 )
-                krylov_analyze_btn = gr.Button("Analyze", variant="primary")
-            with gr.Column(scale=2):
-                krylov_output = gr.Textbox(label="Krylov analysis results", lines=15)
 
-        krylov_analyze_btn.click(
+                train_button = gr.Button(
+                    "Train model",
+                    variant="primary",
+                )
+
+            with gr.Column(scale=2):
+                train_status = gr.Textbox(
+                    label="Training status",
+                    lines=2,
+                )
+
+                corpus_sample = gr.Textbox(
+                    label="Corpus sample",
+                    lines=5,
+                )
+
+                model_summary = gr.Textbox(
+                    label="Model summary",
+                    lines=7,
+                )
+
+        train_button.click(
+            fn=train_model_from_file,
+            inputs=[corpus_file_input],
+            outputs=[
+                train_status,
+                corpus_sample,
+                model_summary,
+            ],
+        )
+
+    with gr.Tab(
+        "Single Prompt Analysis"
+    ):
+        with gr.Row():
+            with gr.Column(scale=1):
+                krylov_prompt = gr.Textbox(
+                    label="Prompt to analyze",
+                    lines=3,
+                )
+
+                krylov_max_iter = gr.Slider(
+                    minimum=5,
+                    maximum=100,
+                    value=30,
+                    step=1,
+                    label="Max Lanczos iterations",
+                )
+
+                krylov_analyze_button = (
+                    gr.Button(
+                        "Analyze",
+                        variant="primary",
+                    )
+                )
+
+            with gr.Column(scale=2):
+                krylov_output = gr.Textbox(
+                    label="Krylov analysis results",
+                    lines=18,
+                )
+
+        krylov_analyze_button.click(
             fn=analyze_krylov_single,
-            inputs=[krylov_prompt, krylov_max_iter],
+            inputs=[
+                krylov_prompt,
+                krylov_max_iter,
+            ],
             outputs=[krylov_output],
         )
 
-    with gr.Tab("Sequence Anomaly Detection"):
+    with gr.Tab(
+        "Sequence Anomaly Detection"
+    ):
         gr.Markdown(
             """
-### Sliding-Window Anomaly Detection
-
-Scans a sequence with sliding windows, computing Krylov complexity for each.
-Anomalies flagged where Lanczos b_n pattern deviates or complexity jumps.
-Use **Generate scorecard PNG** to export the flagged windows, bracketed in
-[ ] amongst the rest of the text, as one image.
+The anomaly detector is based on learned transition dynamics and Krylov
+spreading. It does not label text anomalous simply because the grammar is
+unusual.
 """
         )
+
         with gr.Row():
             with gr.Column(scale=1):
-                anomaly_sequence = gr.Textbox(label="Sequence to scan", lines=5)
-                anomaly_window = gr.Slider(
-                    minimum=5, maximum=50, value=5, step=1,
-                    label="Window size"
+                anomaly_sequence = gr.Textbox(
+                    label="Sequence to scan",
+                    lines=7,
                 )
-                anomaly_stride = gr.Slider(
-                    minimum=1, maximum=20, value=1, step=1,
-                    label="Stride"
-                )
-                anomaly_threshold = gr.Slider(
-                    minimum=0.5, maximum=5.0, value=2.0, step=0.1,
-                    label="Anomaly threshold (std devs)"
-                )
-                anomaly_detect_btn = gr.Button("Detect anomalies", variant="primary")
-                scorecard_btn = gr.Button("Generate scorecard PNG", variant="secondary")
-            with gr.Column(scale=2):
-                anomaly_output = gr.Textbox(label="Anomaly detection results", lines=15)
-                scorecard_image = gr.Image(label="Anomaly scorecard", type="filepath")
-                scorecard_status = gr.Textbox(label="Scorecard status", lines=2)
 
-        anomaly_detect_btn.click(
+                anomaly_window = gr.Slider(
+                    minimum=5,
+                    maximum=50,
+                    value=5,
+                    step=1,
+                    label="Window size",
+                )
+
+                anomaly_stride = gr.Slider(
+                    minimum=1,
+                    maximum=20,
+                    value=1,
+                    step=1,
+                    label="Stride",
+                )
+
+                anomaly_threshold = gr.Slider(
+                    minimum=0.5,
+                    maximum=5.0,
+                    value=2.0,
+                    step=0.1,
+                    label="Contextual anomaly threshold",
+                )
+
+                anomaly_detect_button = (
+                    gr.Button(
+                        "Detect contextual anomalies",
+                        variant="primary",
+                    )
+                )
+
+                scorecard_button = gr.Button(
+                    "Generate scorecard PNG"
+                )
+
+            with gr.Column(scale=2):
+                anomaly_output = gr.Textbox(
+                    label="Anomaly detection results",
+                    lines=18,
+                )
+
+                scorecard_image = gr.Image(
+                    label="Anomaly scorecard",
+                    type="filepath",
+                )
+
+                scorecard_status = gr.Textbox(
+                    label="Scorecard status",
+                    lines=2,
+                )
+
+        anomaly_detect_button.click(
             fn=analyze_krylov_sequence,
-            inputs=[anomaly_sequence, anomaly_window, anomaly_stride, anomaly_threshold],
+            inputs=[
+                anomaly_sequence,
+                anomaly_window,
+                anomaly_stride,
+                anomaly_threshold,
+            ],
             outputs=[anomaly_output],
         )
 
-        scorecard_btn.click(
+        scorecard_button.click(
             fn=generate_anomaly_scorecard,
-            inputs=[anomaly_sequence, anomaly_window, anomaly_stride, anomaly_threshold],
-            outputs=[scorecard_image, scorecard_status],
+            inputs=[
+                anomaly_sequence,
+                anomaly_window,
+                anomaly_stride,
+                anomaly_threshold,
+            ],
+            outputs=[
+                scorecard_image,
+                scorecard_status,
+            ],
         )
 
-    with gr.Tab("Change-Point Detection"):
-        gr.Markdown(
-            """
-### Structural Change-Point Detection
-
-Identifies positions where Krylov complexity or entropy changes abruptly,
-indicating potential topic shifts, style changes, or structural breaks.
-"""
-        )
+    with gr.Tab(
+        "Change-Point Detection"
+    ):
         with gr.Row():
             with gr.Column(scale=1):
-                changepoint_sequence = gr.Textbox(label="Sequence to analyze", lines=5)
-                changepoint_window = gr.Slider(
-                    minimum=10, maximum=100, value=30, step=1,
-                    label="Window size"
+                changepoint_sequence = gr.Textbox(
+                    label="Sequence to analyze",
+                    lines=7,
                 )
-                changepoint_detect_btn = gr.Button("Detect change points", variant="primary")
-            with gr.Column(scale=2):
-                changepoint_output = gr.Textbox(label="Change-point detection results", lines=15)
 
-        changepoint_detect_btn.click(
+                changepoint_window = gr.Slider(
+                    minimum=10,
+                    maximum=100,
+                    value=30,
+                    step=1,
+                    label="Window size",
+                )
+
+                changepoint_button = gr.Button(
+                    "Detect change points",
+                    variant="primary",
+                )
+
+            with gr.Column(scale=2):
+                changepoint_output = gr.Textbox(
+                    label="Change-point detection results",
+                    lines=18,
+                )
+
+        changepoint_button.click(
             fn=detect_change_points,
-            inputs=[changepoint_sequence, changepoint_window],
+            inputs=[
+                changepoint_sequence,
+                changepoint_window,
+            ],
             outputs=[changepoint_output],
         )
 
-    with gr.Tab("Text Generation (Original)"):
-        gr.Markdown("## Text Generation")
+    with gr.Tab(
+        "Text Generation"
+    ):
+        gr.Markdown(
+            """
+## Contextual Text Generation
+
+Every generation step uses the evolving sequence as context.
+
+The scoring combines:
+- trigram/bigram/unigram backoff;
+- a recency-weighted contextual vector;
+- candidate-to-context vector similarity;
+- prompt/kernel similarity;
+- a lightweight Krylov transition signal;
+- soft repetition control.
+
+This is intended to make generation contextual rather than merely
+grammatical.
+"""
+        )
+
         with gr.Row():
             with gr.Column(scale=1):
-                user_prompt = gr.Textbox(label="Prompt", lines=3)
-                paradigm_steps_input = gr.Slider(
-                    minimum=0, maximum=50, value=PARADIGM_STEPS, step=1,
-                    label="Paradigm steps (n)",
+                user_prompt = gr.Textbox(
+                    label="Prompt",
+                    lines=5,
                 )
-                generate_button = gr.Button("Generate", variant="primary")
+
+                paradigm_steps_input = gr.Slider(
+                    minimum=0,
+                    maximum=50,
+                    value=PARADIGM_STEPS,
+                    step=1,
+                    label="Initial paradigm/context steps",
+                )
+
+                generate_button = gr.Button(
+                    "Generate",
+                    variant="primary",
+                )
+
             with gr.Column(scale=2):
-                corpus_output = gr.Textbox(label="Corpus matches", lines=6)
-                generated_output = gr.Textbox(label="Tau model response", lines=8)
+                corpus_output = gr.Textbox(
+                    label="Corpus contextual matches",
+                    lines=7,
+                )
+
+                generated_output = gr.Textbox(
+                    label="Contextual Krylov response",
+                    lines=14,
+                )
 
         generate_button.click(
             fn=generate_from_prompt,
-            inputs=[user_prompt, paradigm_steps_input],
-            outputs=[corpus_output, generated_output],
+            inputs=[
+                user_prompt,
+                paradigm_steps_input,
+            ],
+            outputs=[
+                corpus_output,
+                generated_output,
+            ],
         )
 
 
-if __name__ == "__main__":
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--share", action="store_true")
-    parser.add_argument("--server-name", default="127.0.0.1")
-    parser.add_argument("--server-port", type=int, default=7860)
+
+    parser.add_argument(
+        "--share",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--server-name",
+        default="127.0.0.1",
+    )
+
+    parser.add_argument(
+        "--server-port",
+        type=int,
+        default=7860,
+    )
+
     args = parser.parse_args()
 
     try:
         reload_globals()
     except FileNotFoundError:
-        pass
+        print(
+            "No model.json found yet. "
+            "Upload a corpus and train the model."
+        )
+    except Exception as exc:
+        print(
+            "Warning: could not load existing model: "
+            f"{exc}"
+        )
 
-    demo.launch(server_name=args.server_name, server_port=args.server_port, share=args.share)
+    demo.launch(
+        server_name=args.server_name,
+        server_port=args.server_port,
+        share=args.share,
+    )
+
+
+if __name__ == "__main__":
+    main()
